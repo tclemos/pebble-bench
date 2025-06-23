@@ -2,7 +2,6 @@ package benchmark
 
 import (
 	"errors"
-	"fmt"
 	"iter"
 	"math/rand"
 	"os"
@@ -70,11 +69,13 @@ func RunBenchmark(cfg Config) error {
 			return err
 		}
 	} else {
-		if cfg.KeysFile == "" {
-			return fmt.Errorf("read-only mode requires --keys-file to be set")
+		if cfg.KeysFile != "" {
+			log.Info().Str("path", cfg.KeysFile).Msg("Loading keys from file")
+			keys = loadKeysFromFile(cfg.KeysFile)
+		} else {
+			log.Info().Msg("Loading keys from standard input")
+			keys = loadKeysFromStdin()
 		}
-		log.Info().Str("path", cfg.KeysFile).Msg("Loading keys from file")
-		keys = loadKeysFromFile(cfg.KeysFile)
 	}
 
 	if err := runReadPhase(db, cfg, keys); err != nil {
@@ -94,11 +95,28 @@ func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 	var wg sync.WaitGroup
 	var failed, successful uint64
 
+	// Feed keys to workers
+	go func() {
+		for key := range keys {
+			jobs <- key
+		}
+		close(jobs)
+	}()
+
+	// this interval is required to ensure the channel is ready before workers start
+	time.Sleep(time.Second)
+
 	// Start workers
 	for w := 0; w < cfg.Concurrency; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+
+			// if there is no key to read, just return
+			if len(jobs) == 0 {
+				return
+			}
+
 			rng := rand.New(rand.NewSource(cfg.Seed + int64(workerID)))
 			for key := range jobs {
 				value := generateValue(rng, cfg.ValueSize)
@@ -115,14 +133,6 @@ func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 			}
 		}(w)
 	}
-
-	// Feed keys to workers
-	go func() {
-		defer close(jobs)
-		for key := range keys {
-			jobs <- key
-		}
-	}()
 
 	// Collect results
 	wg.Wait()
@@ -163,13 +173,26 @@ func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 	var wg sync.WaitGroup
 	var totalReads, notFound, failed, successful uint64
 
-	start := time.Now()
+	// Feed keys to workers
+	go func() {
+		for key := range keys {
+			jobs <- key
+		}
+		close(jobs)
+	}()
+
+	time.Sleep(time.Second) // ensure channel is ready before workers start
+
 	for w := 0; w < cfg.Concurrency; w++ {
 		wg.Add(1)
 		go func(workerID int) {
-			defer func() {
-				wg.Done()
-			}()
+			defer wg.Done()
+
+			// if there is no key to read, just return
+			if len(jobs) == 0 {
+				return
+			}
+
 			for key := range jobs {
 				readStart := time.Now()
 				_, closer, err := db.Get(key)
@@ -192,14 +215,6 @@ func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 			}
 		}(w)
 	}
-
-	// Feed keys to workers
-	go func() {
-		for key := range keys {
-			jobs <- key
-		}
-		close(jobs)
-	}()
 
 	// Summarize read times
 	var totalReadTime time.Duration
@@ -228,9 +243,15 @@ func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 	close(readTimeHistory)
 	chDone <- struct{}{}
 
-	elapsed := time.Since(start).Seconds()
-	read_ops_per_sec := float64(atomic.LoadUint64(&totalReads)) / elapsed
-	read_avg_latency_ms := float64(totalReadTime.Microseconds()) / 1000.0 / float64(atomic.LoadUint64(&totalReads))
+	elapsed := totalReadTime.Seconds()
+	read_ops_per_sec := float64(0)
+	if elapsed > 0 {
+		read_ops_per_sec = float64(atomic.LoadUint64(&totalReads)) / elapsed
+	}
+	read_avg_latency_ms := float64(0)
+	if atomic.LoadUint64(&totalReads) > 0 {
+		read_avg_latency_ms = float64(totalReadTime.Microseconds()) / 1000.0 / float64(atomic.LoadUint64(&totalReads))
+	}
 
 	log.Info().
 		Float64("read_ops_per_sec", read_ops_per_sec).
@@ -239,7 +260,7 @@ func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 		Uint64("failed_reads", atomic.LoadUint64(&failed)).
 		Uint64("successful_reads", atomic.LoadUint64(&successful)).
 		Uint64("total_reads", atomic.LoadUint64(&totalReads)).
-		Dur("read_total_elapsed", time.Since(start)).
+		Dur("read_total_elapsed", totalReadTime).
 		Msg("Read benchmark complete")
 
 	return nil
