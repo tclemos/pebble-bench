@@ -3,6 +3,7 @@ package benchmark
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"math/rand"
 	"os"
 	"strings"
@@ -61,7 +62,7 @@ func RunBenchmark(cfg Config) error {
 	}
 	defer db.Close()
 
-	var keys [][]byte
+	var keys iter.Seq[[]byte]
 	if cfg.WriteEnabled {
 		log.Info().Msg("Generating keys for write mode")
 		keys = GenerateKeys(cfg.Seed, cfg.KeyCount)
@@ -73,12 +74,7 @@ func RunBenchmark(cfg Config) error {
 			return fmt.Errorf("read-only mode requires --keys-file to be set")
 		}
 		log.Info().Str("path", cfg.KeysFile).Msg("Loading keys from file")
-		loaded, err := loadKeysFromFile(cfg.KeysFile)
-		if err != nil {
-			return fmt.Errorf("failed to load keys: %w", err)
-		}
-		keys = loaded
-		cfg.KeyCount = len(keys)
+		keys = loadKeysFromFile(cfg.KeysFile)
 	}
 
 	if err := runReadPhase(db, cfg, keys); err != nil {
@@ -89,51 +85,62 @@ func RunBenchmark(cfg Config) error {
 	return nil
 }
 
-// runWritePhase concurrently writes keys to PebbleDB
-func runWritePhase(db *pebble.DB, cfg Config, keys [][]byte) error {
+// runWritePhase concurrently writes keys to PebbleDB using iterator
+func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 	log.Info().Int("workers", cfg.Concurrency).Msg("Beginning write loop")
 
-	jobs := make(chan int, cfg.KeyCount)
-	results := make(chan time.Duration, cfg.KeyCount)
+	jobs := make(chan []byte, cfg.KeyCount)
+	writeTimeHistory := make(chan time.Duration, cfg.KeyCount)
 	var wg sync.WaitGroup
+	var failed, successful uint64
 
-	for i := range keys {
-		jobs <- i
-	}
-	close(jobs)
-
+	// Start workers
 	for w := 0; w < cfg.Concurrency; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(cfg.Seed + int64(workerID)))
-			for i := range jobs {
+			for key := range jobs {
 				value := generateValue(rng, cfg.ValueSize)
+
 				writeStart := time.Now()
-				if err := db.Set(keys[i], value, pebble.NoSync); err != nil {
-					log.Error().Err(err).Int("index", i).Msg("Write failed")
+				err := db.Set(key, value, pebble.NoSync)
+				writeTimeHistory <- time.Since(writeStart)
+
+				if err != nil {
+					atomic.AddUint64(&failed, 1)
 					continue
 				}
-				results <- time.Since(writeStart)
+				atomic.AddUint64(&successful, 1)
 			}
 		}(w)
 	}
 
+	// Feed keys to workers
 	go func() {
-		wg.Wait()
-		close(results)
+		defer close(jobs)
+		for key := range keys {
+			jobs <- key
+		}
 	}()
 
+	// Collect results
+	wg.Wait()
+	close(writeTimeHistory)
+
 	var totalWriteTime time.Duration
-	for d := range results {
-		totalWriteTime += d
+	for writeTime := range writeTimeHistory {
+		totalWriteTime += writeTime
 	}
 
 	elapsed := totalWriteTime.Seconds()
 	ops := float64(cfg.KeyCount) / elapsed
 	avg := float64(totalWriteTime.Microseconds()) / 1000.0 / float64(cfg.KeyCount)
 
-	log.Info().Dur("total_elapsed", totalWriteTime).
+	log.Info().
+		Dur("total_elapsed", totalWriteTime).
+		Uint64("failed_writes", atomic.LoadUint64(&failed)).
+		Uint64("successful_writes", atomic.LoadUint64(&successful)).
 		Float64("ops_per_sec", ops).
 		Float64("avg_latency_ms", avg).
 		Msg("Write benchmark complete")
@@ -145,39 +152,36 @@ func runWritePhase(db *pebble.DB, cfg Config, keys [][]byte) error {
 	return nil
 }
 
-// runReadPhase concurrently reads keys from PebbleDB and tracks performance
-func runReadPhase(db *pebble.DB, cfg Config, keys [][]byte) error {
-	totalReads := int(float64(cfg.KeyCount) * cfg.ReadRatio)
-	log.Info().Int("total_reads", totalReads).Int("workers", cfg.Concurrency).Msg("Beginning read loop")
+// runReadPhase concurrently reads keys from PebbleDB using iterator
+func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
+	log.Info().Int("workers", cfg.Concurrency).Msg("Beginning read loop")
 
-	jobs := make(chan int, totalReads)
-	results := make(chan time.Duration, totalReads)
+	channelBufferSize := cfg.Concurrency * 2
+
+	jobs := make(chan []byte, channelBufferSize)
+	readTimeHistory := make(chan time.Duration, channelBufferSize)
 	var wg sync.WaitGroup
-	var notFound, successful uint64
-
-	rng := rand.New(rand.NewSource(cfg.Seed + 1))
-	for i := 0; i < totalReads; i++ {
-		jobs <- rng.Intn(cfg.KeyCount)
-	}
-	close(jobs)
+	var totalReads, notFound, failed, successful uint64
 
 	start := time.Now()
 	for w := 0; w < cfg.Concurrency; w++ {
 		wg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
-			for i := range jobs {
-				key := keys[i]
-				singleStart := time.Now()
+			defer func() {
+				wg.Done()
+			}()
+			for key := range jobs {
+				readStart := time.Now()
 				_, closer, err := db.Get(key)
-				dur := time.Since(singleStart)
-				results <- dur
+				readTimeHistory <- time.Since(readStart)
+
+				atomic.AddUint64(&totalReads, 1)
 
 				if err != nil {
 					if errors.Is(err, pebble.ErrNotFound) {
 						atomic.AddUint64(&notFound, 1)
 					} else {
-						log.Error().Err(err).Int("index", i).Msg("Read failed")
+						atomic.AddUint64(&failed, 1)
 					}
 					continue
 				}
@@ -189,27 +193,52 @@ func runReadPhase(db *pebble.DB, cfg Config, keys [][]byte) error {
 		}(w)
 	}
 
+	// Feed keys to workers
 	go func() {
-		wg.Wait()
-		close(results)
+		for key := range keys {
+			jobs <- key
+		}
+		close(jobs)
 	}()
 
+	// Summarize read times
 	var totalReadTime time.Duration
-	for i := 0; i < totalReads; i++ {
-		totalReadTime += <-results
-		if i > 0 && i%(totalReads/10) == 0 {
-			log.Info().Int("progress", i).Msg("Reads completed")
+	go func() {
+		for readTime := range readTimeHistory {
+			totalReadTime += readTime
 		}
-	}
+	}()
+
+	// print progress every second while workers are running
+	chDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-chDone:
+				return
+			case <-ticker.C:
+				log.Info().Uint64("total_reads", atomic.LoadUint64(&totalReads)).Msg("Reads in progress")
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(readTimeHistory)
+	chDone <- struct{}{}
 
 	elapsed := time.Since(start).Seconds()
-	ops := float64(totalReads) / elapsed
-	avg := float64(totalReadTime.Microseconds()) / 1000.0 / float64(totalReads)
+	read_ops_per_sec := float64(atomic.LoadUint64(&totalReads)) / elapsed
+	read_avg_latency_ms := float64(totalReadTime.Microseconds()) / 1000.0 / float64(atomic.LoadUint64(&totalReads))
 
-	log.Info().Float64("read_ops_per_sec", ops).
-		Float64("read_avg_latency_ms", avg).
+	log.Info().
+		Float64("read_ops_per_sec", read_ops_per_sec).
+		Float64("read_avg_latency_ms", read_avg_latency_ms).
 		Uint64("not_found", atomic.LoadUint64(&notFound)).
+		Uint64("failed_reads", atomic.LoadUint64(&failed)).
 		Uint64("successful_reads", atomic.LoadUint64(&successful)).
+		Uint64("total_reads", atomic.LoadUint64(&totalReads)).
 		Dur("read_total_elapsed", time.Since(start)).
 		Msg("Read benchmark complete")
 

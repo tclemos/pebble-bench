@@ -1,49 +1,43 @@
 package benchmark
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"iter"
 	"os"
-	"syscall"
 )
 
 // loadKeysFromFile loads a binary file containing keys in the format:
 // [uvarint length][key bytes] repeating.
-func loadKeysFromFile(path string) ([][]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open keys file: %w", err)
-	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat error: %w", err)
-	}
-
-	mm, err := syscall.Mmap(int(file.Fd()), 0, int(stat.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		return nil, fmt.Errorf("mmap error: %w", err)
-	}
-	defer syscall.Munmap(mm)
-
-	var keys [][]byte
-	p := mm
-	for len(p) > 0 {
-		n, nbytes := binary.Uvarint(p)
-		if nbytes <= 0 {
-			return nil, fmt.Errorf("invalid Uvarint header at offset %d", len(mm)-len(p))
+func loadKeysFromFile(path string) iter.Seq[[]byte] {
+	return func(yield func([]byte) bool) {
+		file, err := os.Open(path)
+		if err != nil {
+			panic(fmt.Errorf("failed to open keys file: %w", err))
 		}
-		start, end := nbytes, nbytes+int(n)
-		if end > len(p) {
-			return nil, fmt.Errorf("key bytes truncated: need %d, have %d", end, len(p))
+		defer file.Close()
+
+		r := bufio.NewReader(file)
+		for {
+			n, err := binary.ReadUvarint(r)
+			if err != nil {
+				if err == io.EOF {
+					return
+				}
+				panic(fmt.Errorf("failed to read key length: %w", err))
+			}
+
+			key := make([]byte, n)
+			_, err = io.ReadFull(r, key)
+			if err != nil {
+				panic(fmt.Errorf("failed to read key bytes: %w", err))
+			}
+
+			if !yield(key) {
+				return
+			}
 		}
-		key := make([]byte, n)
-		copy(key, p[start:end])
-		keys = append(keys, key)
-
-		p = p[end:]
 	}
-
-	return keys, nil
 }
