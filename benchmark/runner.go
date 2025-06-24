@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"errors"
+	"fmt"
 	"iter"
 	"math/rand"
 	"os"
@@ -17,55 +18,32 @@ import (
 
 // Config defines the benchmark parameters passed from CLI
 type Config struct {
-	KeyCount     int     // total number of keys to generate
-	ReadRatio    float64 // ratio of reads vs total ops
-	ValueSize    int     // size of values in bytes
-	Seed         int64   // RNG seed for deterministic behavior
-	DBPath       string  // path to PebbleDB instance
-	BenchmarkID  string  // optional label for this benchmark run
-	WriteEnabled bool    // whether to write data to the DB
-	KeysFile     string  // optional file with pre-existing keys
-	Concurrency  int     // number of concurrent workers
-	LogFormat    string
+	KeyCount       int     // total number of keys to generate
+	ReadRatio      float64 // ratio of reads vs total ops
+	ValueSize      int     // size of values in bytes
+	Seed           int64   // RNG seed for deterministic behavior
+	DBPath         string  // path to PebbleDB instance
+	BenchmarkID    string  // optional label for this benchmark run
+	WriteEnabled   bool    // whether to write data to the DB
+	KeysFile       string  // optional file with pre-existing keys
+	Concurrency    int     // number of concurrent workers
+	LogFormat      string  // "json" or "console", default is "console"
+	BlockCacheSize int64   // in bytes, negative means disabled (nil)
 }
 
 // RunBenchmark orchestrates the full benchmark lifecycle
 func RunBenchmark(cfg Config) error {
-	if strings.ToLower(cfg.LogFormat) == "json" {
-		zerolog.TimeFieldFormat = time.RFC3339Nano
-		log.Logger = log.Output(os.Stdout)
-	} else {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"})
-	}
+	setupLog(cfg)
+	initialLog(cfg)
 
-	log.Info().
-		Str("benchmark_id", cfg.BenchmarkID).
-		Int("key_count", cfg.KeyCount).
-		Int("value_size", cfg.ValueSize).
-		Float64("read_ratio", cfg.ReadRatio).
-		Int64("seed", cfg.Seed).
-		Str("db_path", cfg.DBPath).
-		Bool("write_enabled", cfg.WriteEnabled).
-		Str("keys_file", cfg.KeysFile).
-		Int("concurrency", cfg.Concurrency).
-		Msg("Starting benchmark")
-
-	opts := &pebble.Options{}
-	if !cfg.WriteEnabled {
-		opts.ReadOnly = true
-	}
-
-	db, err := pebble.Open(cfg.DBPath, opts)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to open PebbleDB")
-	}
-	defer db.Close()
+	dbConn := createDBConn(cfg)
+	defer dbConn.Close()
 
 	var keys iter.Seq[[]byte]
 	if cfg.WriteEnabled {
 		log.Info().Msg("Generating keys for write mode")
 		keys = GenerateKeys(cfg.Seed, cfg.KeyCount)
-		if err := runWritePhase(db, cfg, keys); err != nil {
+		if err := runWritePhase(dbConn, cfg, keys); err != nil {
 			return err
 		}
 	} else {
@@ -78,12 +56,60 @@ func RunBenchmark(cfg Config) error {
 		}
 	}
 
-	if err := runReadPhase(db, cfg, keys); err != nil {
+	if err := runReadPhase(dbConn, cfg, keys); err != nil {
 		return err
 	}
 
 	log.Info().Str("benchmark_id", cfg.BenchmarkID).Msg("Benchmark complete")
 	return nil
+}
+
+func initialLog(cfg Config) {
+	blockCacheInfo := "disabled"
+	if cfg.BlockCacheSize >= 0 {
+		blockCacheInfo = fmt.Sprintf("enabled, size: %d bytes", uint64(cfg.BlockCacheSize))
+	}
+
+	log.Info().
+		Str("benchmark_id", cfg.BenchmarkID).
+		Int("key_count", cfg.KeyCount).
+		Int("value_size", cfg.ValueSize).
+		Float64("read_ratio", cfg.ReadRatio).
+		Int64("seed", cfg.Seed).
+		Str("db_path", cfg.DBPath).
+		Bool("write_enabled", cfg.WriteEnabled).
+		Str("keys_file", cfg.KeysFile).
+		Int("concurrency", cfg.Concurrency).
+		Str("block_cache", blockCacheInfo).
+		Msg("Starting benchmark")
+}
+
+func setupLog(cfg Config) {
+	if strings.ToLower(cfg.LogFormat) == "json" {
+		zerolog.TimeFieldFormat = time.RFC3339Nano
+		log.Logger = log.Output(os.Stdout)
+	} else {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"})
+	}
+}
+
+func createDBConn(cfg Config) *pebble.DB {
+	opts := &pebble.Options{}
+	if !cfg.WriteEnabled {
+		opts.ReadOnly = true
+	}
+
+	var cache *pebble.Cache
+	if cfg.BlockCacheSize >= 0 {
+		cache = pebble.NewCache(cfg.BlockCacheSize)
+		defer cache.Unref()
+	}
+
+	db, err := pebble.Open(cfg.DBPath, opts)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to open PebbleDB")
+	}
+	return db
 }
 
 // runWritePhase concurrently writes keys to PebbleDB using iterator

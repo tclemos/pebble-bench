@@ -8,16 +8,17 @@ import (
 )
 
 var (
-	keyCount     int
-	readRatio    float64
-	valueSize    int
-	seed         int64
-	dbPath       string
-	benchmarkID  string
-	writeEnabled bool
-	keysFile     string
-	concurrency  int
-	logFormat    string
+	keyCount       int
+	readRatio      float64
+	valueSize      int
+	seed           int64
+	dbPath         string
+	benchmarkID    string
+	writeEnabled   bool
+	keysFile       string
+	concurrency    int
+	logFormat      string
+	blockCacheSize int64 // in bytes, negative means disabled (nil)
 )
 
 // runCmd represents the run command
@@ -56,4 +57,5 @@ func init() {
 	runCmd.Flags().StringVar(&keysFile, "keys-file", "", "Path to binary file containing keys to read")
 	runCmd.Flags().IntVar(&concurrency, "concurrency", 1, "Number of concurrent workers for reads/writes")
 	runCmd.Flags().StringVar(&logFormat, "log-format", "console", "Log format: 'json' or 'console'")
+	runCmd.Flags().Int64Var(&blockCacheSize, "block-cache-size", 8<<20, "Block cache size in bytes (negative for disabled, default 8MB)")
 }
