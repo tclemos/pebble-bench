@@ -62,7 +62,7 @@ Where `size` is a varint indicating the byte length of the next key.
 
 ```bash
 go run main.go run \
-  --db-path /tmp/pebble-bench \
+  --db-path dbs/pebble/benchmark-test \
   --keys-file ./sample/keys.dat \
   --read-ratio 1.0 \
   --benchmark-id read-only-test
@@ -72,7 +72,7 @@ go run main.go run \
 
 ```bash
 go run main.go run \
-  --db-path /tmp/pebble-bench \
+  --db-path dbs/pebble/benchmark-test \
   --keys-file ./sample/keys.dat \
   --read-ratio 1.0 \
   --concurrency 4 \
@@ -84,7 +84,7 @@ go run main.go run \
 ```bash
 go run main.go run \
   --write \
-  --db-path /tmp/pebble-bench \
+  --db-path dbs/pebble/benchmark-test \
   --key-count 10000 \
   --value-size 256 \
   --read-ratio 1.0 \
@@ -97,7 +97,7 @@ go run main.go run \
 ```bash
 go run main.go run \
   --write \
-  --db-path /tmp/pebble-bench \
+  --db-path dbs/pebble/benchmark-test \
   --key-count 10000 \
   --value-size 256 \
   --read-ratio 1.0 \

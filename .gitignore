@@ -34,3 +34,5 @@ go.work.sum
 logs/
 sample/
 .DS_Store
+
+pebble_bench

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-DB_PATH="/tmp/pebble-bench"
+DB_PATH="dbs/pebble/pebble-bench-test"
 KEYS_FILE="./sample/keys.dat"
 CONCURRENCY=4
 READ_RATIO=1.0

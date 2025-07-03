@@ -1,7 +1,6 @@
 package benchmark
 
 import (
-	"errors"
 	"fmt"
 	"iter"
 	"math/rand"
@@ -11,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -22,13 +20,53 @@ type Config struct {
 	ReadRatio      float64 // ratio of reads vs total ops
 	ValueSize      int     // size of values in bytes
 	Seed           int64   // RNG seed for deterministic behavior
-	DBPath         string  // path to PebbleDB instance
+	DBPath         string  // path to database instance
 	BenchmarkID    string  // optional label for this benchmark run
 	WriteEnabled   bool    // whether to write data to the DB
 	KeysFile       string  // optional file with pre-existing keys
 	Concurrency    int     // number of concurrent workers
 	LogFormat      string  // "json" or "console", default is "console"
 	BlockCacheSize int64   // in bytes, negative means disabled (nil)
+
+	// Database backend configuration
+	DatabaseType     string // "pebble", "qmdb", or "mdbx"
+	QMDBLibraryPath  string // path to QMDB shared library
+	
+	// MDBX-specific configuration
+	MDBXMapSize     int64 // maximum map size in bytes (-1 for default)
+	MDBXMaxDbs      int   // maximum number of databases
+	MDBXMaxReaders  int   // maximum number of readers
+	MDBXNoSync      bool  // don't fsync after commit
+	MDBXNoMetaSync  bool  // don't fsync metapage after commit
+	MDBXWriteMap    bool  // use writeable memory map
+	MDBXNoReadahead bool  // disable readahead
+
+	// Workload configuration
+	WorkloadType     string  // Type of workload to run
+	RecentBlockBias  float64 // PoS: probability of accessing recent blocks
+	HotAccountRatio  float64 // PoS: ratio of hot accounts
+	StateLocality    float64 // PoS: probability of accessing related state
+	BlockRange       int     // PoS: range of block numbers
+	AccountCount     int     // PoS: number of unique accounts
+	StorageSlotRatio float64 // PoS: average storage slots per account
+	
+	// Transaction execution workload configuration
+	NetworkType              string  // Network type: ethereum, polygon, custom
+	TransactionMix           string  // Transaction mix: balanced, defi-heavy, transfer-heavy
+	TxHotAccountProb         float64 // Hot account probability for transaction workload
+	TxStorageLocality        float64 // Storage locality factor for transaction workload
+	TxCacheHitRatio          float64 // Cache hit ratio for transaction workload
+	TxAccountTrieDepth       int     // Account trie depth for transaction workload
+	TxStorageTrieDepth       int     // Storage trie depth for transaction workload
+	TxReadWriteRatio         float64 // Read/write ratio for transaction workload
+	TxContractRatio          float64 // Contract ratio for transaction workload
+	TxPerBlock               int     // Transactions per block
+	GasTargetPerBlock        uint64  // Target gas per block
+	TxSimpleTransferRatio    float64 // Simple transfer ratio in transaction mix
+	TxERC20TransferRatio     float64 // ERC-20 transfer ratio in transaction mix
+	TxUniswapSwapRatio       float64 // Uniswap swap ratio in transaction mix
+	TxComplexDeFiRatio       float64 // Complex DeFi ratio in transaction mix
+	TxContractDeployRatio    float64 // Contract deployment ratio in transaction mix
 }
 
 // RunBenchmark orchestrates the full benchmark lifecycle
@@ -36,14 +74,54 @@ func RunBenchmark(cfg Config) error {
 	setupLog(cfg)
 	initialLog(cfg)
 
-	dbConn := createDBConn(cfg)
+	// Create workload instance
+	workloadCfg := WorkloadConfig{
+		Type:             WorkloadType(cfg.WorkloadType),
+		ValueSize:        cfg.ValueSize,
+		ReadRatio:        cfg.ReadRatio,
+		Seed:             cfg.Seed,
+		RecentBlockBias:  cfg.RecentBlockBias,
+		HotAccountRatio:  cfg.HotAccountRatio,
+		StateLocality:    cfg.StateLocality,
+		BlockRange:       cfg.BlockRange,
+		AccountCount:     cfg.AccountCount,
+		StorageSlotRatio: cfg.StorageSlotRatio,
+		// Transaction execution workload configuration
+		NetworkType:              cfg.NetworkType,
+		TransactionMix:           cfg.TransactionMix,
+		TxHotAccountProb:         cfg.TxHotAccountProb,
+		TxStorageLocality:        cfg.TxStorageLocality,
+		TxCacheHitRatio:          cfg.TxCacheHitRatio,
+		TxAccountTrieDepth:       cfg.TxAccountTrieDepth,
+		TxStorageTrieDepth:       cfg.TxStorageTrieDepth,
+		TxReadWriteRatio:         cfg.TxReadWriteRatio,
+		TxContractRatio:          cfg.TxContractRatio,
+		TxPerBlock:               cfg.TxPerBlock,
+		GasTargetPerBlock:        cfg.GasTargetPerBlock,
+		TxSimpleTransferRatio:    cfg.TxSimpleTransferRatio,
+		TxERC20TransferRatio:     cfg.TxERC20TransferRatio,
+		TxUniswapSwapRatio:       cfg.TxUniswapSwapRatio,
+		TxComplexDeFiRatio:       cfg.TxComplexDeFiRatio,
+		TxContractDeployRatio:    cfg.TxContractDeployRatio,
+	}
+	workload := CreateWorkload(workloadCfg)
+
+	log.Info().
+		Str("workload", workload.Name()).
+		Str("description", workload.GetDescription()).
+		Msg("Using workload")
+
+	dbConn, err := createDatabase(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create database: %w", err)
+	}
 	defer dbConn.Close()
 
 	var keys iter.Seq[[]byte]
 	if cfg.WriteEnabled {
 		log.Info().Msg("Generating keys for write mode")
-		keys = GenerateKeys(cfg.Seed, cfg.KeyCount)
-		if err := runWritePhase(dbConn, cfg, keys); err != nil {
+		keys = workload.GenerateKeys(cfg.Seed, cfg.KeyCount)
+		if err := runWritePhase(dbConn, cfg, keys, workload); err != nil {
 			return err
 		}
 	} else {
@@ -56,7 +134,7 @@ func RunBenchmark(cfg Config) error {
 		}
 	}
 
-	if err := runReadPhase(dbConn, cfg, keys); err != nil {
+	if err := runReadPhase(dbConn, cfg, keys, workload); err != nil {
 		return err
 	}
 
@@ -70,8 +148,15 @@ func initialLog(cfg Config) {
 		blockCacheInfo = fmt.Sprintf("enabled, size: %d bytes", uint64(cfg.BlockCacheSize))
 	}
 
+	// Database backend info
+	dbBackend := cfg.DatabaseType
+	if dbBackend == "" {
+		dbBackend = "pebble"
+	}
+
 	log.Info().
 		Str("benchmark_id", cfg.BenchmarkID).
+		Str("database_backend", dbBackend).
 		Int("key_count", cfg.KeyCount).
 		Int("value_size", cfg.ValueSize).
 		Float64("read_ratio", cfg.ReadRatio).
@@ -93,27 +178,37 @@ func setupLog(cfg Config) {
 	}
 }
 
-func createDBConn(cfg Config) *pebble.DB {
-	opts := &pebble.Options{}
-	if !cfg.WriteEnabled {
-		opts.ReadOnly = true
+func createDatabase(cfg Config) (Database, error) {
+	// Default to pebble if not specified
+	dbType := DatabaseType(cfg.DatabaseType)
+	if dbType == "" {
+		dbType = DatabaseTypePebble
 	}
 
-	var cache *pebble.Cache
-	if cfg.BlockCacheSize >= 0 {
-		cache = pebble.NewCache(cfg.BlockCacheSize)
-		defer cache.Unref()
+	dbCfg := DatabaseConfig{
+		Type:           dbType,
+		Path:           cfg.DBPath,
+		ReadOnly:       !cfg.WriteEnabled,
+		BlockCacheSize: cfg.BlockCacheSize,
+		QMDBConfig: QMDBConfig{
+			LibraryPath: cfg.QMDBLibraryPath,
+		},
+		MDBXConfig: MDBXConfig{
+			MapSize:     cfg.MDBXMapSize,
+			MaxDbs:      cfg.MDBXMaxDbs,
+			MaxReaders:  cfg.MDBXMaxReaders,
+			NoSync:      cfg.MDBXNoSync,
+			NoMetaSync:  cfg.MDBXNoMetaSync,
+			WriteMap:    cfg.MDBXWriteMap,
+			NoReadahead: cfg.MDBXNoReadahead,
+		},
 	}
 
-	db, err := pebble.Open(cfg.DBPath, opts)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to open PebbleDB")
-	}
-	return db
+	return NewDatabase(dbCfg)
 }
 
-// runWritePhase concurrently writes keys to PebbleDB using iterator
-func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
+// runWritePhase concurrently writes keys to database using iterator
+func runWritePhase(db Database, cfg Config, keys iter.Seq[[]byte], workload Workload) error {
 	log.Info().Int("workers", cfg.Concurrency).Msg("Beginning write loop")
 
 	jobs := make(chan []byte, cfg.KeyCount)
@@ -145,10 +240,10 @@ func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 
 			rng := rand.New(rand.NewSource(cfg.Seed + int64(workerID)))
 			for key := range jobs {
-				value := generateValue(rng, cfg.ValueSize)
+				value := workload.GenerateValue(rng, key)
 
 				writeStart := time.Now()
-				err := db.Set(key, value, pebble.NoSync)
+				err := db.Set(key, value)
 				writeTimeHistory <- time.Since(writeStart)
 
 				if err != nil {
@@ -188,8 +283,8 @@ func runWritePhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 	return nil
 }
 
-// runReadPhase concurrently reads keys from PebbleDB using iterator
-func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
+// runReadPhase concurrently reads keys from database using iterator
+func runReadPhase(db Database, cfg Config, keys iter.Seq[[]byte], workload Workload) error {
 	log.Info().Int("workers", cfg.Concurrency).Msg("Beginning read loop")
 
 	channelBufferSize := cfg.Concurrency * 2
@@ -227,7 +322,7 @@ func runReadPhase(db *pebble.DB, cfg Config, keys iter.Seq[[]byte]) error {
 				atomic.AddUint64(&totalReads, 1)
 
 				if err != nil {
-					if errors.Is(err, pebble.ErrNotFound) {
+					if IsKeyNotFound(err) {
 						atomic.AddUint64(&notFound, 1)
 					} else {
 						atomic.AddUint64(&failed, 1)
