@@ -4,7 +4,7 @@ go 1.24.1
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/erigontech/mdbx-go v0.0.0-20241130110020-c5b6be95effc
+	github.com/erigontech/mdbx-go v0.40.0
 	github.com/ethereum/go-ethereum v1.15.11
 	github.com/rs/zerolog v1.34.0
 	github.com/spf13/cobra v1.9.1
@@ -55,6 +55,3 @@ require (
 // - NoCache block cache disabling (Step 1)
 // - High-resolution read path instrumentation (Step 2)
 replace github.com/cockroachdb/pebble => ../pebble
-
-// Use local MDBX Go bindings
-replace github.com/erigontech/mdbx-go => ../mdbx-go
